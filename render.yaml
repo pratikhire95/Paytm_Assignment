@@ -1,16 +1,22 @@
 # Render Blueprint: New > Blueprint > pick this repository. It creates the PostgreSQL database and the web service,
 # wires them together and generates the two secrets - nothing sensitive is stored in this file.
 #
-# Free-tier facts that matter for grading (check Render's current pricing page before relying on them):
-#   * a free web service has 512 MB RAM / 0.1 CPU and is put to sleep after 15 minutes without traffic; the first
-#     request after that is a JVM cold start (see .github/workflows/keepwarm.yml and README.md "Cold starts");
-#   * a free PostgreSQL database expires after 30 days - move to a paid plan for anything that must outlive that.
-# For the ~20,000-request burst a larger instance is much faster: change both `plan:` lines below.
+# Free-tier facts that matter for grading (from Render's docs, checked 2 Oct 2026 - re-check before relying on them):
+#   * a free web service has 512 MB RAM / 0.1 CPU. It is spun down after 15 minutes without traffic and needs about a
+#     minute to spin up again, plus the JVM start (see .github/workflows/keepwarm.yml and README.md "Cold starts");
+#   * a free PostgreSQL database has 256 MB RAM, 1 GB storage and no backups, and EXPIRES 30 days after creation (14 more
+#     days to upgrade it, then it is deleted). Only one free database can exist per Render workspace.
+#
+# For the ~20,000-request burst use bigger plans: change both `plan:` lines below, e.g. the web service to `0.5c-512mb`
+# (0.5 CPU) or `1c-2g` (1 CPU, 2 GB) and the database to `0.1c-256mb` or `0.5c-1g`; then raise JAVA_OPTS' memory share only
+# if the instance has more than 512 MB. Legacy plan names (starter, standard, basic-256mb ...) still work too.
 databases:
   - name: seats-db
     databaseName: seats
     user: seats
     plan: free
+    # The version CI and docker-compose.yml test against, so what is tested is what runs. Cannot be changed after creation.
+    postgresMajorVersion: "16"
 
 services:
   - type: web
@@ -22,12 +28,17 @@ services:
     # Liveness. (/readyz also checks the database; it is what monitors and the burst script use.)
     healthCheckPath: /healthz
     envVars:
+      # Render routes traffic to $PORT (default 10000). Stated explicitly so the platform and the app cannot disagree.
+      - key: PORT
+        value: "10000"
+      # The database's INTERNAL connection string (postgresql://user:password@host:port/database), reachable from services
+      # in the same region over Render's private network. The app turns it into a JDBC URL itself.
       - key: DATABASE_URL
         fromDatabase:
           name: seats-db
           property: connectionString
-      # Generated once by Render, visible only to you in the dashboard (Environment tab). Give the ADMIN_TOKEN to the
-      # reviewers through the submission, never through the repository.
+      # Generated once by Render (random 256-bit values), visible only to you in the dashboard (Environment tab). Give the
+      # ADMIN_TOKEN to the reviewers through the submission, never through the repository.
       - key: ADMIN_TOKEN
         generateValue: true
       - key: TOKEN_SECRET

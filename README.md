@@ -40,13 +40,23 @@ make down
 Without `make`: copy `.env.example` to `.env`, fill the three secrets (`openssl rand -hex 32`), run
 `docker compose up -d --build`, then `./burst.sh http://localhost:8080`.
 
-Without Docker: start any PostgreSQL 14+, then
+Without Docker (macOS with Homebrew; on Linux install PostgreSQL with your package manager):
 
 ```bash
-export DATABASE_URL=jdbc:postgresql://localhost:5432/seats DB_USER=seats DB_PASSWORD=...   # or postgres://user:pass@host/db
+brew install postgresql@16 && brew services start postgresql@16
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+createdb seats && createdb seats_test        # seats_test is a scratch database for the tests
+
+cd seatManagement
+export DATABASE_URL=jdbc:postgresql://localhost:5432/seats DB_USER=$(whoami)   # Homebrew's default role has no password
 export ADMIN_TOKEN=$(openssl rand -hex 32) TOKEN_SECRET=$(openssl rand -hex 48)
-cd seatManagement && ./mvnw spring-boot:run
+./mvnw spring-boot:run                       # Flyway creates the tables on start-up; http://localhost:8080/readyz
+
+# all tests, including the PostgreSQL concurrency tests (they write freely into the database they are pointed at):
+TEST_DATABASE_URL=jdbc:postgresql://localhost:5432/seats_test TEST_DB_USER=$(whoami) ./mvnw test
 ```
+
+With a remote or password-protected PostgreSQL use `DATABASE_URL=postgresql://user:password@host:5432/dbname` instead (see "The database" below).
 
 The schema is created by Flyway at start-up. The service **refuses to start** without `ADMIN_TOKEN` (16+ chars),
 `TOKEN_SECRET` (32+ chars) and a database - there are no default secrets.
@@ -165,19 +175,46 @@ an 800-operation random mix of reserves and cancels, then database-level checks 
 `ApiSmokeTest` exercises the HTTP contract end to end. The rest are plain unit tests (token forging/expiry, route table, validation, JSON/metrics rendering, configuration parsing).
 CI (`.github/workflows/ci.yml`) runs all of it against PostgreSQL, then builds the Docker image and runs the burst test against the composed stack.
 
+## The database
+
+The service needs one **empty PostgreSQL database** (14+; CI and Docker use 16) and nothing else. **It creates its own tables:** Flyway runs `V1__init.sql` when the service starts, under a database lock,
+so you never run SQL by hand and several instances may start at once. Hand it the connection through `DATABASE_URL`, in any of these forms (credentials may be URL-encoded):
+
+- `postgresql://user:password@host:5432/dbname` - what Render and most hosts give you (`postgres://` works too; the port is optional);
+- `jdbc:postgresql://host:5432/dbname` together with `DB_USER` and `DB_PASSWORD`;
+- or no `DATABASE_URL` at all, but `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`.
+
+Add `?sslmode=require` when the database is reached over the public internet (not needed on a provider's private network). Connect **directly**, not through a transaction-mode pooler (PgBouncer, Supabase's port-6543 pooler):
+the service sets session timeouts on each connection and runs its own pool (`DB_POOL_SIZE`, default 20 - keep it below the database's connection limit; the Render free database allows 100).
+
 ## Deploying
 
-`render.yaml` is a Render Blueprint: **New > Blueprint > select this repository**. It creates the PostgreSQL database and the web service
-(Docker, built from `seatManagement/Dockerfile`), generates `ADMIN_TOKEN` and `TOKEN_SECRET` (visible only in your dashboard under *Environment*), and uses `/healthz` as the platform health check.
-Any host that runs a Docker image and gives you a PostgreSQL URL works the same way: build `seatManagement/`, set `DATABASE_URL` (`postgres://user:pass@host:5432/db` or `jdbc:postgresql://...` + `DB_USER`/`DB_PASSWORD`), `ADMIN_TOKEN`, `TOKEN_SECRET`.
+### On Render (what `render.yaml` automates)
 
-**Cold starts.** A free web service sleeps after ~15 minutes without traffic and the next request pays a full JVM start (a minute or more on 0.1 CPU).
+1. Push this repository to GitHub.
+2. In the Render dashboard choose **New > Blueprint**, connect your GitHub account, click **Connect** next to this repository, keep the defaults and click **Deploy Blueprint**. Render reads `render.yaml` and creates
+   - the PostgreSQL 16 database `seats-db`, and
+   - the Docker web service `seat-reservation` (built from `seatManagement/Dockerfile`) with `DATABASE_URL` set to the database's internal connection string, `PORT=10000`, and `ADMIN_TOKEN` / `TOKEN_SECRET` generated for you.
+3. Wait for the first build (a few minutes: Maven downloads its dependencies). The service is up when `https://<name>.onrender.com/readyz` answers `200`; the platform health check is `/healthz`.
+4. Read the admin token: service `seat-reservation` > **Environment** > `ADMIN_TOKEN` (hand it over with the submission, never in the repository).
+5. Check the deployment: `ADMIN_TOKEN=<token> ./burst.sh https://<name>.onrender.com --quick`, then the full run without `--quick`.
+6. Paste the URL at the top of this file. Optionally add the repository variable `SERVICE_URL` (GitHub: Settings > Secrets and variables > Actions > Variables) so the keep-warm workflow can ping it.
+
+Any other host that runs a Docker image and gives you a PostgreSQL URL works the same way: build `seatManagement/`, set `DATABASE_URL`, `ADMIN_TOKEN` (16+ chars), `TOKEN_SECRET` (32+ chars) and, if the platform does not inject it, `PORT`.
+
+### Free tier facts (Render docs, checked 2 Oct 2026)
+
+- **Web service, free plan:** 0.1 CPU, 512 MB. It spins down after 15 minutes without traffic and takes about a minute to spin back up, plus the JVM start. 750 free instance hours per workspace and month.
+- **Database, free plan:** 256 MB RAM, 1 GB storage, no backups, at most 100 connections. It **expires 30 days after creation**, with 14 more days to upgrade it before it is deleted, and a workspace may have **only one** free database
+  (if you already have one, delete it or give `seats-db` a paid plan in `render.yaml`).
+- Paid plans: change `plan:` in `render.yaml` (web `0.5c-512mb` = 0.5 CPU / 512 MB, `1c-2g` = 1 CPU / 2 GB; database `0.1c-256mb`, `0.5c-1g`, ...) and push; Render redeploys. Upgrading the workspace plan alone does not lift free-instance limits.
+
+**Cold starts.** A sleeping free service pays a full JVM start on the next request (a minute or more on 0.1 CPU).
 `.github/workflows/keepwarm.yml` pings `/readyz` every 10 minutes if you set the repository variable `SERVICE_URL`; any uptime monitor works too.
 The burst script and the Docker `HEALTHCHECK` are written to wait for this instead of failing.
 
 **Capacity.** The free tier (512 MB, 0.1 CPU, shared database) is enough for correctness but slow under a 20,000-request burst, and a platform proxy may answer slow requests with `502/504`, which count as 5xx.
-For the grading window use a paid instance (a larger plan in `render.yaml`) and set `DB_POOL_SIZE` to match the database's connection limit.
-Free databases may also expire (Render: 30 days) - check before submitting.
+For the grading window use paid plans (see above) and keep `DB_POOL_SIZE` below the database's connection limit.
 
 ## Configuration (environment variables)
 
