@@ -1,0 +1,29 @@
+name: keep-warm
+
+# Free hosting tiers put an idle service to sleep, and the first request afterwards is a full JVM cold start.
+# This workflow pings the deployed service every 10 minutes so a reviewer never meets that cold start.
+#
+# Setup: Repository > Settings > Secrets and variables > Actions > Variables > New repository variable
+#        SERVICE_URL = https://<your-service>.onrender.com
+# Without that variable the job does nothing. Notes: GitHub may delay scheduled runs under load, and disables
+# scheduled workflows after 60 days without repository activity (re-enable them under the Actions tab).
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ping:
+    if: ${{ vars.SERVICE_URL != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: GET /readyz (wakes the service and proves the database is reachable)
+        env:
+          SERVICE_URL: ${{ vars.SERVICE_URL }}
+        run: |
+          curl --fail --silent --show-error --max-time 120 --retry 3 --retry-delay 10 --retry-connrefused \
+            "${SERVICE_URL%/}/readyz"
