@@ -1,0 +1,18 @@
+# secrets and local configuration
+.env
+*.pem
+*.key
+
+# build output
+target/
+out/
+*.class
+
+# editors / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# git transfer artefacts
+*.bundle
