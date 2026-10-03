@@ -116,6 +116,8 @@ Seat gauges are read from the database at scrape time (one statement = one snaps
 
 First moves on a page: `GET /logs?limit=500` (or the platform log stream) filtered by `status>=500`, take a `request_id` from a failing response and pull its full trail with `GET /logs?request_id=...`,
 check `db_pool_*` and the database's connection count / `pg_stat_activity` for long lock waits. Every log line is JSON and carries `request_id`, `user_id`, `route`, `status`, `duration_ms`, `outcome`; tokens are never logged.
+Every 503 also logs its cause (`database call failed, answering 503: cause=pool_timeout|lock_timeout|statement_timeout|connection_lost|...`), which separates "saturated" from "database slow" from "database gone" without reading code;
+for `pool_timeout` the line includes the pool's own counters (`total`, `active`, `idle`, `waiting`).
 
 ## 6. AI usage: directed vs decided
 
@@ -140,7 +142,12 @@ check `db_pool_*` and the database's connection count / `pg_stat_activity` for l
 **How it was checked.** The AI's sandbox had no Maven, Docker or PostgreSQL, so it could not run the service. What it did instead: compiled all main and test sources with `javac` against hand-written stubs of the Spring/Hikari/servlet APIs
 and ran the pure-logic unit tests; and validated the burst tool against a small in-memory fake of the API, including deliberately broken variants (check-then-act race, ignored idempotency keys, unenforced limit, random 500s,
 wrong metrics), each of which the tool caught. The SQL, the Spring Boot wiring and the PostgreSQL concurrency tests had **not been executed by the AI**.
-[TODO: what you ran and saw - e.g. `make test-db` green on <date>, `make burst` output against the deployed URL, anything that failed and how it was fixed.]
+**First real run (3 Oct 2026, Render free plan: 0.1 CPU / 512 MB web service, free PostgreSQL).** `./burst.sh <url> --quick` (2,199 HTTP requests from 2,000 users, up to 300 in flight): 39 of 41 checks passed, including every correctness check -
+no seat sold twice, every retry replayed its original, the per-user limit held under 10 parallel requests, `available + held + confirmed == total_seats`, the final seat map equalled bookings - cancellations + re-bookings,
+and the `/metrics` counters equalled what the clients saw. The two failed checks were one event: 6 requests were answered `503 service_unavailable` (the server's latency histogram shows exactly 6 requests slower than 30 s, which is
+consistent with the 30 s database-pool wait limit). The instance managed about 42 requests/s with a median latency near 5 s, so the free plan was saturated; the design was not wrong, but the run did not meet "zero 5xx".
+Follow-ups from it: a 503 now logs its cause, the pool wait on Render is 60 s, and the graded run uses a paid plan.
+[TODO: your own runs - `make test-db` / the CI result, the full 20,000-request run on the paid plan, and anything else that failed and how it was fixed.]
 
 **Git history.** The AI wrote the code in one long session and assembled the history *afterwards*: it replayed the finished working tree as 15 milestone commits (schema, platform, engine, API, tests, burst tool, Docker/CI, docs),
 each of which compiles on its own against the sandbox stubs. The commits therefore all carry timestamps from within a few minutes of each other and are a readable reconstruction of the build order, not a log of when the work happened.

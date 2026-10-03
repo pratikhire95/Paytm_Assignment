@@ -8,11 +8,11 @@ Design notes, trade-offs and the AI-usage disclosure are in **[WRITEUP.md](WRITE
 
 | | |
 |---|---|
-| **Live URL** | `TODO: paste the deployed URL here` |
-| Readiness / liveness | `<live-url>/readyz` · `<live-url>/healthz` |
-| Metrics (Prometheus text) | `<live-url>/metrics` |
-| Recent logs (JSON lines, public) | `<live-url>/logs?limit=200` · `<live-url>/logs?request_id=<id>` |
-| Burst test | `./burst.sh <live-url>` (needs the admin token, see below) |
+| **Live URL** | https://seat-reservation-zepg.onrender.com |
+| Readiness / liveness | [/readyz](https://seat-reservation-zepg.onrender.com/readyz) · [/healthz](https://seat-reservation-zepg.onrender.com/healthz) |
+| Metrics (Prometheus text) | [/metrics](https://seat-reservation-zepg.onrender.com/metrics) |
+| Recent logs (JSON lines, public) | [/logs?limit=200](https://seat-reservation-zepg.onrender.com/logs?limit=200) · `/logs?request_id=<id>` |
+| Burst test | `ADMIN_TOKEN=<token> ./burst.sh https://seat-reservation-zepg.onrender.com` (the admin token is handed over with the submission, see below) |
 
 ## What it guarantees
 
@@ -213,8 +213,11 @@ Any other host that runs a Docker image and gives you a PostgreSQL URL works the
 `.github/workflows/keepwarm.yml` pings `/readyz` every 10 minutes if you set the repository variable `SERVICE_URL`; any uptime monitor works too.
 The burst script and the Docker `HEALTHCHECK` are written to wait for this instead of failing.
 
-**Capacity.** The free tier (512 MB, 0.1 CPU, shared database) is enough for correctness but slow under a 20,000-request burst, and a platform proxy may answer slow requests with `502/504`, which count as 5xx.
-For the grading window use paid plans (see above) and keep `DB_POOL_SIZE` below the database's connection limit.
+**Capacity.** The free tier (0.1 CPU, 512 MB, free database) is enough to prove correctness but not to carry load: it serves roughly 40 requests per second, so a stampede queues up. Overload is answered with a `503 + Retry-After`, never with a wrong answer:
+a request waits for one of the `DB_POOL_SIZE` database connections for up to `DB_CONNECTION_TIMEOUT_MS` (30 s by default, 60 s in `render.yaml`) and only then gets the 503. The server log line `database call failed, answering 503: cause=...`
+says which limit was hit (`pool_timeout`, `lock_timeout`, `statement_timeout`, `connection_lost`, ...). A platform proxy may also answer very slow requests with `502/504`. The burst test counts every 5xx as a failure.
+For the grading window use paid plans (see above): 20,000 open connections need memory as well as CPU, so give the web service more than 512 MB, and keep `DB_POOL_SIZE` below the database's connection limit.
+A lower `--concurrency` (for example `./burst.sh <url> --quick --concurrency 60`) stays under the timeout on the free plan.
 
 ## Configuration (environment variables)
 
@@ -225,7 +228,7 @@ For the grading window use paid plans (see above) and keep `DB_POOL_SIZE` below 
 | `DATABASE_URL` | **required** | `jdbc:postgresql://...` (then also `DB_USER`, `DB_PASSWORD`) or `postgres://user:pass@host:5432/db`; alternatively `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` |
 | `PORT` | 8080 | injected by most platforms |
 | `DB_POOL_SIZE` | 20 | JDBC connections per instance (the real concurrency limit; extra requests queue) |
-| `DB_CONNECTION_TIMEOUT_MS` | 30000 | max wait for a pooled connection before `503` |
+| `DB_CONNECTION_TIMEOUT_MS` | 30000 (60000 in `render.yaml`) | max wait for a pooled connection before `503` |
 | `DEFAULT_PER_USER_LIMIT` | 4 | used when a show does not specify `per_user_limit` |
 | `TOKEN_TTL_SECONDS` | 86400 | |
 | `ALLOW_TOKEN_MINT` | true | `POST /auth/token` |
