@@ -147,6 +147,13 @@ no seat sold twice, every retry replayed its original, the per-user limit held u
 and the `/metrics` counters equalled what the clients saw. The two failed checks were one event: 6 requests were answered `503 service_unavailable` (the server's latency histogram shows exactly 6 requests slower than 30 s, which is
 consistent with the 30 s database-pool wait limit). The instance managed about 42 requests/s with a median latency near 5 s, so the free plan was saturated; the design was not wrong, but the run did not meet "zero 5xx".
 Follow-ups from it: a 503 now logs its cause, the pool wait on Render is 60 s, and the graded run uses a paid plan.
+
+**Second run (the full 20,000-request run on the same free plan).** It stopped during setup, before a single reservation was sent: 1 of the 20,000 `POST /auth/token` calls came back `HTTP 520`. 520 is a status the CDN/proxy in front of a Render service
+writes when it gets no valid answer from the origin; the service never writes it (it stamps `X-Request-Id` on every response it produces, and its `/metrics` show no 5xx at all), so this was not a wrong answer from the application. I could not establish the cause from the outside.
+Follow-ups: minting a token is stateless, so the burst tool now repeats a transient setup answer (5xx, 429, a dropped connection) up to six times and reports it as a warning instead of aborting; during the storm every 5xx still fails the run, but the
+report now says how many carried no `X-Request-Id` (made by a proxy) and how many came from the service; and Tomcat's idle keep-alive went from 60 s to 130 s, because Render's troubleshooting guide for intermittent `Connection reset by peer` errors says to keep
+the server's keep-alive timeout above 120 s - a precaution, not a proven cause.
+
 [TODO: your own runs - `make test-db` / the CI result, the full 20,000-request run on the paid plan, and anything else that failed and how it was fixed.]
 
 **Git history.** The AI wrote the code in one long session and assembled the history *afterwards*: it replayed the finished working tree as 15 milestone commits (schema, platform, engine, API, tests, burst tool, Docker/CI, docs),

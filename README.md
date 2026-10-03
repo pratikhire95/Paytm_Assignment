@@ -13,6 +13,7 @@ Design notes, trade-offs and the AI-usage disclosure are in **[WRITEUP.md](WRITE
 | Metrics (Prometheus text) | [/metrics](https://seat-reservation-zepg.onrender.com/metrics) |
 | Recent logs (JSON lines, public) | [/logs?limit=200](https://seat-reservation-zepg.onrender.com/logs?limit=200) · `/logs?request_id=<id>` |
 | Burst test | `ADMIN_TOKEN=<token> ./burst.sh https://seat-reservation-zepg.onrender.com` (the admin token is handed over with the submission, see below) |
+| Postman collection | [`postman/seat-reservation.postman_collection.json`](postman/seat-reservation.postman_collection.json): import it, set the `adminToken` variable, **Run collection** |
 
 ## What it guarantees
 
@@ -24,6 +25,20 @@ Design notes, trade-offs and the AI-usage disclosure are in **[WRITEUP.md](WRITE
 - **Identity comes from the bearer token only.** A `user_id` in a request body is ignored; only the owner can cancel.
 - **Multi-seat requests are all-or-nothing.** If any requested seat is taken nothing is booked.
 - Money is integer paise.
+
+## Testing it (for reviewers)
+
+All you need is the live URL above and the admin token that came with the submission. The token only guards `POST /shows`; users need no secret.
+
+| Way | What it shows |
+|---|---|
+| `ADMIN_TOKEN=<token> ./burst.sh https://seat-reservation-zepg.onrender.com` | The stampede: 20,000 reservations from 20,000 users with a hot-seat storm, racing retries and cancel/re-book churn, then the reconciliation against `GET /shows/{id}` and `/metrics`. Needs a JDK 11+ (or Docker). `--quick` is a 2,000-request smoke run. Details in "The burst test" below. |
+| [`postman/seat-reservation.postman_collection.json`](postman/seat-reservation.postman_collection.json) | Import it into Postman, open the collection > **Variables**, paste the admin token into `adminToken` (Current value), press **Run collection**. Every request carries assertions: auth, create, reserve, idempotent replay, key conflict, seat taken, all-or-nothing, per-user limit, a spoofed `user_id`, cancel and re-book, the `available + held + confirmed == total_seats` invariant, metrics and logs. The requests run one after another, so this shows the contract; concurrency is what the burst is for. Each run uses fresh ids, so it can be repeated. |
+| The curl walkthrough under "API" | The same steps by hand. |
+| `make up`, then `./burst.sh http://localhost:8080` | A private copy on your own machine (Docker). |
+
+To drive it with your own load tool: mint a token per user with `POST /auth/token {"user_id":"u123"}` (public, no secret), create the show once with the admin token,
+then send `POST /shows/{id}/reserve` with `Authorization: Bearer <user token>` and an `Idempotency-Key` header. Status codes and error codes are in the "API" tables.
 
 ## Quick start
 
@@ -161,6 +176,9 @@ It needs only a JDK 11+ (a single dependency-free Java file, `scripts/Burst.java
 
 Exit code `0` = all checks passed, `1` = a correctness check failed, `2` = it could not run. Use `--lenient-metrics` when other traffic hits the same
 service (metric deltas then become warnings). Connection-level failures (stale keep-alive connections) are retried with the same idempotency key and reported as a warning.
+Minting the 20,000 tokens is setup and has no side effects, so a transient answer there (a proxy's `520`/`502`/`504`, a `503`, a `429`, a dropped connection) is repeated up to six times and reported as a warning;
+only a request that still fails aborts the run (exit `2`). During the storm itself every 5xx stays a failure, and the report says how many of them carried no `X-Request-Id` header: the service stamps one on every response it writes,
+so a 5xx without it was produced by a proxy in front of the service.
 
 ## Tests
 
@@ -215,7 +233,8 @@ The burst script and the Docker `HEALTHCHECK` are written to wait for this inste
 
 **Capacity.** The free tier (0.1 CPU, 512 MB, free database) is enough to prove correctness but not to carry load: it serves roughly 40 requests per second, so a stampede queues up. Overload is answered with a `503 + Retry-After`, never with a wrong answer:
 a request waits for one of the `DB_POOL_SIZE` database connections for up to `DB_CONNECTION_TIMEOUT_MS` (30 s by default, 60 s in `render.yaml`) and only then gets the 503. The server log line `database call failed, answering 503: cause=...`
-says which limit was hit (`pool_timeout`, `lock_timeout`, `statement_timeout`, `connection_lost`, ...). A platform proxy may also answer very slow requests with `502/504`. The burst test counts every 5xx as a failure.
+says which limit was hit (`pool_timeout`, `lock_timeout`, `statement_timeout`, `connection_lost`, ...). A platform proxy may also answer very slow requests with `502/504`, or with a Cloudflare-style `520` when it loses its connection to the service; the service keeps idle connections open for 130 s (`TOMCAT_KEEP_ALIVE_TIMEOUT`),
+longer than the 120 s that Render's troubleshooting guide recommends, so that it is never the side that closes a connection the proxy is about to reuse. The burst test counts every 5xx as a failure.
 For the grading window use paid plans (see above): 20,000 open connections need memory as well as CPU, so give the web service more than 512 MB, and keep `DB_POOL_SIZE` below the database's connection limit.
 A lower `--concurrency` (for example `./burst.sh <url> --quick --concurrency 60`) stays under the timeout on the free plan.
 
@@ -237,6 +256,7 @@ A lower `--concurrency` (for example `./burst.sh <url> --quick --concurrency 60`
 | `METRICS_MAX_SHOWS` | 10 | shows exported as seat gauges |
 | `ACCESS_LOG_LEVEL` | INFO | `WARN` silences the per-request access line on very small instances |
 | `TOMCAT_MAX_THREADS` · `TOMCAT_MAX_CONNECTIONS` · `TOMCAT_ACCEPT_COUNT` · `VIRTUAL_THREADS` | 400 · 30000 · 4096 · false | HTTP server sizing |
+| `TOMCAT_KEEP_ALIVE_TIMEOUT` | 130s | how long an idle keep-alive connection stays open; keep it above the proxy's idle time (Render recommends 120 s) |
 | `JAVA_OPTS` | see `Dockerfile` | JVM flags in the container |
 
 ## Repository layout
@@ -251,6 +271,7 @@ seatManagement/                       the service (Maven project)
   src/test/java/...                   unit, concurrency (PostgreSQL) and HTTP tests
   Dockerfile
 scripts/Burst.java · burst.sh         the one-command burst test
+postman/                              Postman collection with assertions (import, set adminToken, Run collection)
 docker-compose.yml · Makefile         local stack and shortcuts
 render.yaml · .github/workflows/      deployment blueprint, CI, keep-warm
 WRITEUP.md                            design notes

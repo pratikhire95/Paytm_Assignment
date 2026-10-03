@@ -1,0 +1,1945 @@
+{
+  "info": {
+    "_postman_id": "b042744f-ff09-4092-9d73-505b630544d7",
+    "name": "Seat Reservation Service",
+    "description": "Walkthrough of the whole API with assertions. Run it with **Run collection** (Collection Runner) for a pass/fail result, or send the requests one by one.\n\n**Set up**\n1. Open this collection > **Variables**.\n2. `baseUrl` is the live service (change it to `http://localhost:8080` for a local stack).\n3. Paste the `ADMIN_TOKEN` you were given into `adminToken` (**Current value**; the initial value stays empty). Only requests 2.3 and 6.3 need it.\n\nEach run uses a fresh `runId` for user ids and idempotency keys, so it can be repeated. The requests run one after another: this collection shows the API contract and the clean declines. The concurrency guarantees (exactly one winner per hot seat under 20,000 simultaneous requests, no 5xx, reconciliation) are shown by `./burst.sh <BASE_URL>` in the repository.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1 · Is it up?",
+      "description": "Liveness, readiness (a real database check that fails closed) and the self-describing index. On a free host the very first call can take a minute or two (cold start): just send it again.",
+      "item": [
+        {
+          "name": "1.1 Liveness - GET /healthz",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// New run => new ids, so the whole collection can be re-run any number of times.",
+                  "pm.collectionVariables.set('runId', Date.now().toString(36) + Math.floor(Math.random() * 1296).toString(36));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('200 UP', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.status).to.eql('UP');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/healthz",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "description": "Process is up and answering. Deliberately does not touch the database (a database outage must not cause restart loops).\n\nThe first request of every run also generates a fresh `runId`, so user ids and idempotency keys never collide with an earlier run."
+          },
+          "response": []
+        },
+        {
+          "name": "1.2 Readiness - GET /readyz",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('200 READY and the database dependency is UP', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.status).to.eql('READY');",
+                  "    pm.expect(body.database).to.eql('UP');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/readyz",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "readyz"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "description": "Runs a real `SELECT 1` on a separate small pool. Returns 503 when the database cannot be reached or while shutting down (fails closed)."
+          },
+          "response": []
+        },
+        {
+          "name": "1.3 Index - GET /",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('200 and lists the endpoints', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.endpoints).to.be.an('array');",
+                  "    pm.expect(body.endpoints.length).to.be.above(5);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": []
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "description": "Self-describing entry point: how to authenticate and which endpoints exist."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "2 · Tokens and a fresh show",
+      "description": "Two users and one show for the rest of the run. `POST /auth/token` stands in for an identity provider: anyone may ask for a token for any user id. `POST /shows` needs the admin credential (collection variable `adminToken`).",
+      "item": [
+        {
+          "name": "2.1 Token for alice - POST /auth/token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('200 and a bearer token', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.token).to.be.a('string');",
+                  "    pm.expect(body.token_type).to.eql('Bearer');",
+                  "    pm.expect(body.user_id).to.eql('alice-' + pm.collectionVariables.get('runId'));",
+                  "    pm.expect(body.expires_in).to.be.above(0);",
+                  "});",
+                  "if (body.token) {",
+                  "    pm.collectionVariables.set('aliceToken', body.token);",
+                  "    pm.collectionVariables.set('aliceId', body.user_id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "token"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"alice-{{runId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "2.2 Token for bob - POST /auth/token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('200 and a bearer token', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.token).to.be.a('string');",
+                  "});",
+                  "if (body.token) {",
+                  "    pm.collectionVariables.set('bobToken', body.token);",
+                  "    pm.collectionVariables.set('bobId', body.user_id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "token"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"bob-{{runId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "2.3 Create a show (admin) - POST /shows",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (!pm.variables.get('adminToken')) {",
+                  "    throw new Error('adminToken is empty: open the collection > Variables and paste the ADMIN_TOKEN you were given (Current value).');",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('201 Created, six seats, all available', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "    pm.expect(body.id).to.be.a('string');",
+                  "    pm.expect(body.total_seats).to.eql(6);",
+                  "    pm.expect(body.available).to.eql(6);",
+                  "    pm.expect(body.held).to.eql(0);",
+                  "    pm.expect(body.confirmed).to.eql(0);",
+                  "    pm.expect(body.price_paise).to.eql(25000);",
+                  "    pm.expect(body.per_user_limit).to.eql(4);",
+                  "    pm.expect(body.seats.every(function (s) { return s.status === 'available'; })).to.eql(true);",
+                  "});",
+                  "if (body.id) { pm.collectionVariables.set('showId', body.id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{adminToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"postman-{{runId}}\",\n  \"seats\": [\n    \"A1\",\n    \"A2\",\n    \"A3\",\n    \"A4\",\n    \"A5\",\n    \"A6\"\n  ],\n  \"price_paise\": 25000,\n  \"per_user_limit\": 4\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Admin only. Money is an integer number of paise. Needs the collection variable `adminToken` (the ADMIN_TOKEN you were given)."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3 · Reserve (contract and clean declines)",
+      "description": "Every decline here is a 4xx with a machine-readable `error.code`; none is a 5xx. This folder runs the requests one after another, so it shows the contract; the concurrency guarantees are shown by `./burst.sh <BASE_URL>`.",
+      "item": [
+        {
+          "name": "3.1 alice reserves A1, A2 - 201",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('201 Created, confirmed, integer paise (2 x 25000)', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "    pm.expect(body.status).to.eql('confirmed');",
+                  "    pm.expect(body.seats).to.eql(['A1', 'A2']);",
+                  "    pm.expect(body.amount_paise).to.eql(50000);",
+                  "});",
+                  "pm.test('user_id is the token user', function () {",
+                  "    pm.expect(body.user_id).to.eql(pm.collectionVariables.get('aliceId'));",
+                  "});",
+                  "pm.test('every response carries an X-Request-Id (correlation id)', function () {",
+                  "    pm.expect(pm.response.headers.get('X-Request-Id')).to.be.a('string');",
+                  "});",
+                  "// remembered for 7.3, which looks this request up in the logs",
+                  "if (pm.response.headers.get('X-Request-Id')) {",
+                  "    pm.collectionVariables.set('reserveRequestId', pm.response.headers.get('X-Request-Id'));",
+                  "}",
+                  "if (body.reservation_id) { pm.collectionVariables.set('aliceReservationId', body.reservation_id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "alice-{{runId}}-order-1",
+                "type": "text"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "pm-{{runId}}-reserve",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{aliceToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"A1\",\n    \"A2\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Identity comes from the bearer token. The idempotency key goes in the `Idempotency-Key` header (an `X-Idempotency-Key` header or an `idempotency_key` body field also work). Every response carries an `X-Request-Id`; the service honours one sent by the client, and 7.3 uses the id it got back to find this request in `/logs`."
+          },
+          "response": []
+        },
+        {
+          "name": "3.2 same key, same seats - 200 replay",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('200 (not 201) with Idempotent-Replay: true', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.headers.get('Idempotent-Replay')).to.eql('true');",
+                  "});",
+                  "pm.test('the original reservation is returned', function () {",
+                  "    pm.expect(body.reservation_id).to.eql(pm.collectionVariables.get('aliceReservationId'));",
+                  "    pm.expect(body.seats).to.eql(['A1', 'A2']);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "alice-{{runId}}-order-1",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{aliceToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"A1\",\n    \"A2\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "A retry of a successful request returns the original reservation and books nothing new."
+          },
+          "response": []
+        },
+        {
+          "name": "3.3 same key, different seats - 409 idempotency_key_conflict",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('409 idempotency_key_conflict', function () {",
+                  "    pm.response.to.have.status(409);",
+                  "    pm.expect(body.error.code).to.eql('idempotency_key_conflict');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "alice-{{runId}}-order-1",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{aliceToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"A3\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "3.4 bob asks for the taken seat A1 - 409 seat_taken",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('409 seat_taken naming A1 (a clean decline, not an error)', function () {",
+                  "    pm.response.to.have.status(409);",
+                  "    pm.expect(body.error.code).to.eql('seat_taken');",
+                  "    pm.expect(body.error.seats).to.eql(['A1']);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "bob-{{runId}}-order-1",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{bobToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"A1\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "3.5 bob asks for A3 + taken A1 - all-or-nothing 409",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('409 seat_taken naming only A1', function () {",
+                  "    pm.response.to.have.status(409);",
+                  "    pm.expect(body.error.code).to.eql('seat_taken');",
+                  "    pm.expect(body.error.seats).to.eql(['A1']);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "bob-{{runId}}-order-2",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{bobToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"A3\",\n    \"A1\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Multi-seat requests are all-or-nothing: A1 is taken, so A3 must NOT be booked either (checked in 4.1)."
+          },
+          "response": []
+        },
+        {
+          "name": "3.6 alice asks for 3 more (holds 2, limit 4) - 409 per_user_limit",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('409 per_user_limit, limit 4, nothing booked', function () {",
+                  "    pm.response.to.have.status(409);",
+                  "    pm.expect(body.error.code).to.eql('per_user_limit');",
+                  "    pm.expect(body.error.limit).to.eql(4);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "alice-{{runId}}-order-2",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{aliceToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"A3\",\n    \"A4\",\n    \"A5\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "3.7 bob sends user_id = alice in the body - acts as bob",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('201 and the reservation belongs to bob, not alice', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "    pm.expect(body.user_id).to.eql(pm.collectionVariables.get('bobId'));",
+                  "    pm.expect(body.user_id).to.not.eql(pm.collectionVariables.get('aliceId'));",
+                  "});",
+                  "if (body.reservation_id) { pm.collectionVariables.set('bobReservationId', body.reservation_id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "bob-{{runId}}-order-3",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{bobToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"A6\"\n  ],\n  \"user_id\": \"{{aliceId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "A spoofed identity field in the body is ignored: the reservation belongs to the token user."
+          },
+          "response": []
+        },
+        {
+          "name": "3.8 no token - 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('401 unauthorized', function () {",
+                  "    pm.response.to.have.status(401);",
+                  "    pm.expect(body.error.code).to.eql('unauthorized');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "anon-{{runId}}-order-1",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"A4\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "3.9 no idempotency key - 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('400 idempotency_key_required', function () {",
+                  "    pm.response.to.have.status(400);",
+                  "    pm.expect(body.error.code).to.eql('idempotency_key_required');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{aliceToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"A4\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "3.10 seat that is not in the show - 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('422 unknown_seat', function () {",
+                  "    pm.response.to.have.status(422);",
+                  "    pm.expect(body.error.code).to.eql('unknown_seat');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "alice-{{runId}}-order-3",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{aliceToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"Z99\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4 · Show state and the invariant",
+      "description": "Public and read-only. One consistent snapshot per response, so `available + held + confirmed == total_seats` always holds.",
+      "item": [
+        {
+          "name": "4.1 show with every seat - GET /shows/{id}",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('available + held + confirmed == total_seats', function () {",
+                  "    pm.expect(body.available + body.held + body.confirmed).to.eql(body.total_seats);",
+                  "    pm.expect(body.counts.available + body.counts.held + body.counts.confirmed).to.eql(body.counts.total);",
+                  "});",
+                  "",
+                  "var status = {};",
+                  "(body.seats || []).forEach(function (s) { status[s.seat] = s.status; });",
+                  "pm.test('3 confirmed (A1, A2 alice; A6 bob), 3 available, 0 held', function () {",
+                  "    pm.expect(body.confirmed).to.eql(3);",
+                  "    pm.expect(body.available).to.eql(3);",
+                  "    pm.expect(body.held).to.eql(0);",
+                  "    pm.expect(body.seats.length).to.eql(6);",
+                  "});",
+                  "pm.test('all-or-nothing held: A3 (in the declined 3.5) is still available', function () {",
+                  "    pm.expect(status['A3']).to.eql('available');",
+                  "    pm.expect(status['A1']).to.eql('confirmed');",
+                  "    pm.expect(status['A6']).to.eql('confirmed');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "4.2 counts only - GET /shows/{id}?seats=false",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('available + held + confirmed == total_seats', function () {",
+                  "    pm.expect(body.available + body.held + body.confirmed).to.eql(body.total_seats);",
+                  "    pm.expect(body.counts.available + body.counts.held + body.counts.confirmed).to.eql(body.counts.total);",
+                  "});",
+                  "",
+                  "pm.test('counts only, no per-seat list', function () {",
+                  "    pm.expect(body).to.not.have.property('seats');",
+                  "    pm.expect(body.confirmed).to.eql(3);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}?seats=false",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}"
+              ],
+              "query": [
+                {
+                  "key": "seats",
+                  "value": "false"
+                }
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "description": "The cheap form, meant for polling during a burst."
+          },
+          "response": []
+        },
+        {
+          "name": "4.3 unknown show - 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('404 show_not_found', function () {",
+                  "    pm.response.to.have.status(404);",
+                  "    pm.expect(body.error.code).to.eql('show_not_found');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/shows/00000000-0000-0000-0000-000000000000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "00000000-0000-0000-0000-000000000000"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "5 · Cancel and re-book",
+      "description": "Release is an explicit, owner-only, idempotent cancel. A released seat is immediately bookable again, and the per-user quota is given back.",
+      "item": [
+        {
+          "name": "5.1 bob cancels alice's reservation - 403",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('403 forbidden: only the owner may cancel', function () {",
+                  "    pm.response.to.have.status(403);",
+                  "    pm.expect(body.error.code).to.eql('forbidden');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/reservations/{{aliceReservationId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{aliceReservationId}}",
+                "cancel"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{bobToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "5.2 alice cancels - 200 cancelled",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('200 and status cancelled', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.status).to.eql('cancelled');",
+                  "    pm.expect(body.cancelled_at).to.be.a('string');",
+                  "    pm.expect(body.reservation_id).to.eql(pm.collectionVariables.get('aliceReservationId'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/reservations/{{aliceReservationId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{aliceReservationId}}",
+                "cancel"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{aliceToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "5.3 alice cancels again - 200 replay, harmless",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('200 with Idempotent-Replay: true', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.headers.get('Idempotent-Replay')).to.eql('true');",
+                  "    pm.expect(body.status).to.eql('cancelled');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/reservations/{{aliceReservationId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{aliceReservationId}}",
+                "cancel"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{aliceToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "5.4 unknown reservation - 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('404 reservation_not_found', function () {",
+                  "    pm.response.to.have.status(404);",
+                  "    pm.expect(body.error.code).to.eql('reservation_not_found');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/reservations/00000000-0000-0000-0000-000000000000/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "00000000-0000-0000-0000-000000000000",
+                "cancel"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{aliceToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "5.5 bob re-books the released A1 - 201",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('201: the released seat is bookable again', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "    pm.expect(body.seats).to.eql(['A1']);",
+                  "    pm.expect(body.user_id).to.eql(pm.collectionVariables.get('bobId'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "bob-{{runId}}-order-4",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{bobToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"A1\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "5.6 alice books A3, A4, A5 - 201 (quota given back)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('201, 3 x 25000 paise', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "    pm.expect(body.amount_paise).to.eql(75000);",
+                  "    pm.expect(body.seats).to.eql(['A3', 'A4', 'A5']);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "alice-{{runId}}-order-4",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{aliceToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seats\": [\n    \"A3\",\n    \"A4\",\n    \"A5\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Rejected with per_user_limit in 3.6 while alice held two seats; fine now that her cancelled seats count for nothing."
+          },
+          "response": []
+        },
+        {
+          "name": "5.7 show after cancel and re-book - GET /shows/{id}",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('available + held + confirmed == total_seats', function () {",
+                  "    pm.expect(body.available + body.held + body.confirmed).to.eql(body.total_seats);",
+                  "    pm.expect(body.counts.available + body.counts.held + body.counts.confirmed).to.eql(body.counts.total);",
+                  "});",
+                  "",
+                  "var status = {};",
+                  "(body.seats || []).forEach(function (s) { status[s.seat] = s.status; });",
+                  "pm.test('5 confirmed, 1 available (A2), 0 held', function () {",
+                  "    pm.expect(body.confirmed).to.eql(5);",
+                  "    pm.expect(body.available).to.eql(1);",
+                  "    pm.expect(body.held).to.eql(0);",
+                  "    pm.expect(status['A2']).to.eql('available');",
+                  "});",
+                  "pm.collectionVariables.set('availableNow', String(body.available));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/shows/{{showId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "6 · Admin rules and input validation",
+      "item": [
+        {
+          "name": "6.1 normal user creates a show - 403",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('403 forbidden', function () {",
+                  "    pm.response.to.have.status(403);",
+                  "    pm.expect(body.error.code).to.eql('forbidden');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{aliceToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"nope\",\n  \"seats\": [\n    \"A1\"\n  ],\n  \"price_paise\": 100\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "6.2 no token creates a show - 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('401 unauthorized', function () {",
+                  "    pm.response.to.have.status(401);",
+                  "    pm.expect(body.error.code).to.eql('unauthorized');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"nope\",\n  \"seats\": [\n    \"A1\"\n  ],\n  \"price_paise\": 100\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "6.3 fractional price - 400 (money is integer paise)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (!pm.variables.get('adminToken')) {",
+                  "    throw new Error('adminToken is empty: open the collection > Variables and paste the ADMIN_TOKEN you were given (Current value).');",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var body = {};",
+                  "try { body = pm.response.json(); } catch (e) { body = {}; }",
+                  "",
+                  "pm.test('400 invalid_request', function () {",
+                  "    pm.response.to.have.status(400);",
+                  "    pm.expect(body.error.code).to.eql('invalid_request');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/shows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{adminToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"fractional\",\n  \"seats\": [\"A1\"],\n  \"price_paise\": 250.5\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "7 · Metrics and logs",
+      "description": "The numbers above are visible here. Counters are per process; the `seats_*` gauges are read from the database at scrape time, so they equal `GET /shows/{id}`.",
+      "item": [
+        {
+          "name": "7.1 Prometheus metrics - GET /metrics",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var text = pm.response.text();",
+                  "pm.test('200 Prometheus text', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.headers.get('Content-Type')).to.include('text/plain');",
+                  "});",
+                  "pm.test('required series are exposed', function () {",
+                  "    ['reservations_confirmed_total', 'reservations_declined_total', 'seats_available', 'server_errors_total'].forEach(function (m) {",
+                  "        pm.expect(text).to.include(m);",
+                  "    });",
+                  "});",
+                  "pm.test('declined-by-reason: seat_taken, per_user_limit, idempotent_replay', function () {",
+                  "    pm.expect(text).to.include('reservations_declined_total{reason=\"seat_taken\"}');",
+                  "    pm.expect(text).to.include('reservations_declined_total{reason=\"per_user_limit\"}');",
+                  "    pm.expect(text).to.include('reservations_declined_total{reason=\"idempotent_replay\"}');",
+                  "});",
+                  "pm.test('reservations_confirmed_total counted this run (4 reservations, so >= 4)', function () {",
+                  "    var m = text.match(/^reservations_confirmed_total\\s+([0-9.eE+-]+)/m);",
+                  "    pm.expect(m, 'reservations_confirmed_total line').to.not.equal(null);",
+                  "    pm.expect(Number(m[1])).to.be.at.least(4);",
+                  "});",
+                  "pm.test('seats_available gauge for this show equals GET /shows/{id}.available', function () {",
+                  "    var re = new RegExp('seats_available\\\\{show_id=\"' + pm.collectionVariables.get('showId') + '\"\\\\}\\\\s+([0-9.]+)');",
+                  "    var m = text.match(re);",
+                  "    pm.expect(m, 'gauge line (the 10 most recent shows are exported)').to.not.equal(null);",
+                  "    pm.expect(Number(m[1])).to.eql(Number(pm.collectionVariables.get('availableNow')));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/metrics",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "metrics"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "7.2 recent logs - GET /logs",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var text = pm.response.text();",
+                  "var rows = text.split('\\n').filter(function (l) { return l.trim().length > 0; });",
+                  "pm.test('200 newline-delimited JSON', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(rows.length).to.be.above(0);",
+                  "    rows.forEach(function (l) { JSON.parse(l); });",
+                  "});",
+                  "pm.test('lines carry ts, level and message', function () {",
+                  "    var o = JSON.parse(rows[0]);",
+                  "    pm.expect(o).to.have.property('ts');",
+                  "    pm.expect(o).to.have.property('level');",
+                  "    pm.expect(o).to.have.property('message');",
+                  "});",
+                  "pm.test('no bearer token appears in the logs', function () {",
+                  "    pm.expect(text).to.not.include(pm.collectionVariables.get('aliceToken'));",
+                  "    pm.expect(text).to.not.include(pm.collectionVariables.get('bobToken'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/logs?limit=50",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "logs"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50"
+                }
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "description": "Structured JSON log lines, newest last. Tokens are never logged, and no stack traces are exposed."
+          },
+          "response": []
+        },
+        {
+          "name": "7.3 one request's log lines by request id - GET /logs?request_id=",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var rows = pm.response.text().split('\\n').filter(function (l) { return l.trim().length > 0; }).map(function (l) { return JSON.parse(l); });",
+                  "pm.test('200 and at least one line for the request', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(rows.length).to.be.above(0);",
+                  "});",
+                  "pm.test('every line carries that request id', function () {",
+                  "    rows.forEach(function (o) { pm.expect(o.request_id).to.eql(pm.collectionVariables.get('reserveRequestId')); });",
+                  "});",
+                  "pm.test('the access line says: user alice, status 201, outcome confirmed', function () {",
+                  "    var hit = rows.filter(function (o) { return o.outcome === 'confirmed'; })[0];",
+                  "    pm.expect(hit, 'access line with outcome=confirmed').to.not.equal(undefined);",
+                  "    pm.expect(String(hit.status)).to.eql('201');",
+                  "    pm.expect(hit.user_id).to.eql(pm.collectionVariables.get('aliceId'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/logs?request_id={{reserveRequestId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "logs"
+              ],
+              "query": [
+                {
+                  "key": "request_id",
+                  "value": "{{reserveRequestId}}"
+                }
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "description": "The `X-Request-Id` returned by 3.1 finds every log line of that request (run 3.1 first). Only if heavy traffic has not pushed the lines out of the in-memory buffer meanwhile."
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Safety net when a single request is sent on its own: make sure a runId exists.",
+          "if (!pm.collectionVariables.get('runId')) {",
+          "    pm.collectionVariables.set('runId', Date.now().toString(36) + Math.floor(Math.random() * 1296).toString(36));",
+          "}"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Applies to every request: declines are 4xx domain outcomes, never server errors.",
+          "// (/healthz and /readyz are exempt: a 503 from /readyz while the service starts is the correct, fail-closed answer.)",
+          "var name = pm.info.requestName || '';",
+          "if (name.indexOf('/healthz') === -1 && name.indexOf('/readyz') === -1) {",
+          "    pm.test('no 5xx', function () { pm.expect(pm.response.code).to.be.below(500); });",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://seat-reservation-zepg.onrender.com",
+      "type": "string"
+    },
+    {
+      "key": "adminToken",
+      "value": "",
+      "type": "string"
+    }
+  ]
+}

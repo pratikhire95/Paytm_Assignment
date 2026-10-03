@@ -41,6 +41,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class Burst {
 
@@ -624,7 +625,8 @@ public class Burst {
         int serverErrors = dist.get(Outcome.SERVER_ERROR);
         int transport = dist.get(Outcome.TRANSPORT);
         check(serverErrors == 0 && transport == 0, "zero 5xx responses and zero connection failures",
-                serverErrors + " x 5xx, " + transport + " x connection failure" + firstProblems(results, Outcome.SERVER_ERROR, Outcome.TRANSPORT));
+                serverErrors + " x 5xx" + originOfServerErrors(results, serverErrors) + ", " + transport + " x connection failure"
+                        + firstProblems(results, Outcome.SERVER_ERROR, Outcome.TRANSPORT));
         check(dist.get(Outcome.UNEXPECTED) == 0 && dist.get(Outcome.OTHER_409) == 0 && dist.get(Outcome.PER_USER_LIMIT) == 0
                         && dist.get(Outcome.KEY_CONFLICT) == 0,
                 "every response is one of: 201 created, 200 idempotent replay, 409 seat_taken",
@@ -1054,6 +1056,25 @@ public class Burst {
         return sb.toString();
     }
 
+    /**
+     * Who produced the 5xx answers? The service stamps an X-Request-Id on every response it writes, so a 5xx without one (a
+     * Cloudflare-style 520, a 502 or 504 from the platform's router) was produced by a proxy in front of the service. Both count as
+     * failures - a client cannot tell them apart - but they point at different places to look.
+     */
+    private static String originOfServerErrors(Result[] results, int serverErrors) {
+        if (serverErrors == 0) {
+            return "";
+        }
+        int fromProxy = 0;
+        for (Result r : results) {
+            if (r.outcome == Outcome.SERVER_ERROR && r.requestId == null) {
+                fromProxy++;
+            }
+        }
+        return " (" + fromProxy + " without an X-Request-Id, i.e. produced by a proxy in front of the service; " + (serverErrors - fromProxy)
+                + " answered by the service itself - see /logs?request_id=...)";
+    }
+
     private static String firstProblems(Result[] results, Outcome a, Outcome b) {
         StringBuilder sb = new StringBuilder();
         int shown = 0;
@@ -1122,11 +1143,37 @@ public class Burst {
     // =============================================================================================== service helpers
 
     private Resp call(String method, String path, String bearer, String idemKey, String body) {
-        Resp r = api.send(method, path, bearer, idemKey, body, cfg.timeoutSeconds).join();
+        return noteRequestId(api.send(method, path, bearer, idemKey, body, cfg.timeoutSeconds).join());
+    }
+
+    /** Like {@link #call} for setup calls that are safe to repeat as they are: a transient answer (5xx, 429...) is retried. */
+    private Resp callRepeatable(String method, String path, String bearer, String body) {
+        return noteRequestId(api.sendRepeatable(method, path, bearer, body, cfg.timeoutSeconds).join());
+    }
+
+    private Resp noteRequestId(Resp r) {
         if (sampleRequestId == null && r.requestId != null) {
             sampleRequestId = r.requestId;
         }
         return r;
+    }
+
+    /** How many setup retries have already been reported as a warning (the counter itself lives in {@link Api}). */
+    private int setupRetriesReported;
+
+    private void reportSetupRetries() {
+        int total = api.setupRetries.get();
+        if (total > setupRetriesReported) {
+            warn(n(total - setupRetriesReported) + " token request(s) had to be repeated after a transient answer (first: " + api.firstSetupRetry.get()
+                    + "). Minting a token has no side effects, so repeating it is safe. A 5xx without an X-Request-Id header was "
+                    + "produced by a proxy in front of the service, not by the service.");
+            setupRetriesReported = total;
+        }
+    }
+
+    /** The hint to print when token issuance fails for a reason a retry cannot fix. */
+    private static String mintHint(Resp r) {
+        return r.status == 403 || r.status == 404 ? " (token issuance must be enabled on the target: ALLOW_TOKEN_MINT=true)" : "";
     }
 
     private static String newKey() {
@@ -1134,16 +1181,21 @@ public class Burst {
     }
 
     private String mintToken(String userId) {
-        Resp r = call("POST", "/auth/token", null, null, "{\"user_id\":\"" + userId + "\"}");
+        Resp r = callRepeatable("POST", "/auth/token", null, "{\"user_id\":\"" + userId + "\"}");
         String token = r.status == 200 ? str(obj(r.body), "token") : null;
+        reportSetupRetries();
         if (token == null) {
             throw new Abort("could not get a token for " + userId + " from POST /auth/token: " + (r.status < 0 ? r.transportError : "HTTP " + r.status)
-                    + " (token issuance must be enabled on the target: ALLOW_TOKEN_MINT=true)");
+                    + mintHint(r));
         }
         return token;
     }
 
-    /** Mints {@code count} tokens for users {@code prefix + i}, 200 at a time. */
+    /**
+     * Mints {@code count} tokens for users {@code prefix + i}, 200 at a time. This is setup, not the thing under test, and minting is
+     * stateless, so a transient answer (a proxy's 520/502/504, a 503, a 429, a dropped connection) is repeated with a growing pause;
+     * only a request that still fails after all repeats aborts the run.
+     */
     private String[] mintTokens(int count, String prefix) throws InterruptedException {
         String[] tokens = new String[count];
         Semaphore permits = new Semaphore(Math.min(200, cfg.concurrency));
@@ -1153,7 +1205,7 @@ public class Burst {
         for (int i = 0; i < count; i++) {
             final int idx = i;
             permits.acquire();
-            api.send("POST", "/auth/token", null, null, "{\"user_id\":\"" + prefix + i + "\"}", cfg.timeoutSeconds)
+            api.sendRepeatable("POST", "/auth/token", null, "{\"user_id\":\"" + prefix + i + "\"}", cfg.timeoutSeconds)
                     .whenComplete((r, e) -> {
                         try {
                             String token = r != null && r.status == 200 ? str(obj(r.body), "token") : null;
@@ -1173,8 +1225,10 @@ public class Burst {
                     });
         }
         done.await();
+        reportSetupRetries();
         if (failed.get() > 0) {
-            throw new Abort(failed.get() + " of " + count + " token requests failed (first: " + firstError + ")");
+            throw new Abort(failed.get() + " of " + count + " token requests still failed after " + Api.SETUP_RETRIES + " repeats each (first: "
+                    + firstError + ")");
         }
         return tokens;
     }
@@ -1354,8 +1408,14 @@ public class Burst {
         private final HttpClient client;
         private final ExecutorService executor;
         private final String base;
+        /** How often a setup call that is safe to repeat is repeated after a transient HTTP answer (see sendRepeatable). */
+        static final int SETUP_RETRIES = 6;
+
         /** Total re-sends so far; any non-zero value is reported, because a re-sent request may have been applied already. */
         final AtomicInteger transportRetries = new AtomicInteger();
+        /** Total repeats of setup calls after a transient answer, and what the first such answer was. Reported as a warning. */
+        final AtomicInteger setupRetries = new AtomicInteger();
+        final AtomicReference<String> firstSetupRetry = new AtomicReference<>();
 
         Api(Config cfg) {
             this.executor = Executors.newFixedThreadPool(Math.max(8, Runtime.getRuntime().availableProcessors() * 2), r -> {
@@ -1396,6 +1456,41 @@ public class Burst {
                 long delayMs = 100L * (1L << (2 * retries)) + (System.nanoTime() & 0x3F); // 100, 400, 1600 ms (+ jitter)
                 CompletableFuture.runAsync(
                         () -> attempt(result, method, path, bearer, idemKey, body, timeoutSeconds, retries + 1, firstStart),
+                        CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, executor));
+            });
+        }
+
+        /** 408 / 425 / 429, any 5xx (including the 520-526 range a CDN or proxy answers with when it loses its connection to the service), or no response at all. */
+        private static boolean transientAnswer(Resp r) {
+            return r.status < 0 || r.status == 408 || r.status == 425 || r.status == 429 || r.status >= 500;
+        }
+
+        /**
+         * Like {@link #send}, for calls that are safe to repeat exactly as they are (minting a token has no side effects): a TRANSIENT
+         * HTTP answer is repeated too, up to {@link #SETUP_RETRIES} times with a growing pause (0.25 s ... 5 s). It is deliberately not
+         * used for reserve or cancel: there every 5xx must be counted and shown, never absorbed.
+         */
+        CompletableFuture<Resp> sendRepeatable(String method, String path, String bearer, String body, int timeoutSeconds) {
+            CompletableFuture<Resp> result = new CompletableFuture<>();
+            attemptRepeatable(result, method, path, bearer, body, timeoutSeconds, 0);
+            return result;
+        }
+
+        private void attemptRepeatable(CompletableFuture<Resp> result, String method, String path, String bearer, String body,
+                int timeoutSeconds, int attempt) {
+            send(method, path, bearer, null, body, timeoutSeconds).whenComplete((r, e) -> {
+                if (r == null) { // send() never completes exceptionally; belt and braces
+                    result.complete(new Resp(-1, null, null, null, 0, String.valueOf(e), 0));
+                    return;
+                }
+                if (!transientAnswer(r) || attempt >= SETUP_RETRIES) {
+                    result.complete(r);
+                    return;
+                }
+                setupRetries.incrementAndGet();
+                firstSetupRetry.compareAndSet(null, r.status < 0 ? r.transportError : "HTTP " + r.status);
+                long delayMs = Math.min(5000L, 250L << attempt) + (System.nanoTime() & 0xFF); // 250, 500, 1000, 2000, 4000, 5000 ms (+ jitter)
+                CompletableFuture.runAsync(() -> attemptRepeatable(result, method, path, bearer, body, timeoutSeconds, attempt + 1),
                         CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, executor));
             });
         }
