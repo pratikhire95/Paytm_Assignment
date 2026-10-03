@@ -45,6 +45,11 @@ services:
         generateValue: true
       - key: DB_POOL_SIZE
         value: "20"
+      # How long a request may wait for a pooled database connection before it is answered 503. The default is 30 s; the first
+      # real burst on the free plan (0.1 CPU) had 6 of 2,199 requests wait just past that, so wait longer here: a slow success is
+      # better than a 503 for a client that counts 5xx.
+      - key: DB_CONNECTION_TIMEOUT_MS
+        value: "60000"
       # Keep the JVM inside the 512 MB limit of the free plan.
       - key: JAVA_OPTS
         value: "-XX:+UseSerialGC -XX:MaxRAMPercentage=65 -XX:+ExitOnOutOfMemoryError -Dfile.encoding=UTF-8"
